@@ -282,6 +282,20 @@ func (errs MultiParseError) ErrorsAndWarns() *multierror.Error {
 	return result
 }
 
+func (errs MultiParseError) merge(otherErrs MultiParseError) MultiParseError {
+Main:
+	for _, err := range otherErrs {
+		for _, e := range errs {
+			if e.path == err.path {
+				e.merge(&err)
+				continue Main
+			}
+		}
+		errs = append(errs, err)
+	}
+	return errs
+}
+
 // ParsePlugconfFile parses plugconf and returns parsed info and parse error and
 // warnings.
 // path is a filepath of plugconf.
@@ -582,24 +596,16 @@ func convertToDecodableFunc(funcBody string, reposPath pathutil.ReposPath, repos
 	return funcBody
 }
 
-type reposDepTree struct {
-	// The nodes' dependTo are nil. These repos's ranks are always 0.
-	leaves []reposDepNode
-}
-
-type reposDepNode struct {
-	repos      *lockjson.Repos
-	dependTo   []reposDepNode
-	dependedBy []reposDepNode
-}
-
 // ParseMultiPlugconf parses plugconfs of given reposList.
 func ParseMultiPlugconf(reposList []lockjson.Repos) (*MultiParsedInfo, MultiParseError) {
 	plugconfMap, parseErr := parsePlugconfAsMap(reposList)
 	if parseErr.HasErrs() {
 		return nil, parseErr
 	}
-	sortByDepends(reposList, plugconfMap)
+	parseErr = parseErr.merge(sortByDepends(reposList, plugconfMap))
+	if parseErr.HasErrs() {
+		return nil, parseErr
+	}
 	return &MultiParsedInfo{
 		plugconfMap: plugconfMap,
 		reposList:   reposList,
@@ -802,22 +808,83 @@ func parsePlugconfAsMap(reposList []lockjson.Repos) (map[pathutil.ReposPath]*Par
 	return plugconfMap, parseErrAll
 }
 
+type visitingStatus int
+
+const (
+	notVisited visitingStatus = iota
+	visiting
+	visited
+)
+
 // Move the plugins which was depended to previous plugin which depends to them.
 // reposList is sorted in-place.
-func sortByDepends(reposList []lockjson.Repos, plugconfMap map[pathutil.ReposPath]*ParsedInfo) {
-	reposMap, depsMap, rdepsMap := getDepMaps(reposList, plugconfMap)
-	rank := make(map[pathutil.ReposPath]int, len(reposList))
+func sortByDepends(reposList []lockjson.Repos, plugconfMap map[pathutil.ReposPath]*ParsedInfo) (parseErrAll MultiParseError) {
+	visitedStatusMap := make(map[pathutil.ReposPath]visitingStatus, len(reposList))
+	order := make(map[pathutil.ReposPath]int, len(reposList))
 	for i := range reposList {
-		if _, exists := rank[reposList[i].Path]; !exists {
-			tree := makeDepTree(reposList[i].Path, reposMap, depsMap, rdepsMap)
-			for i := range tree.leaves {
-				makeRank(rank, &tree.leaves[i], 0)
-			}
+		if visitedStatusMap[reposList[i].Path] == notVisited {
+			errors := visitRepos([]pathutil.ReposPath{reposList[i].Path}, reposList, plugconfMap, visitedStatusMap, order)
+			parseErrAll = append(parseErrAll, errors...)
 		}
 	}
+	if parseErrAll.HasErrs() {
+		return
+	}
+
 	sort.Slice(reposList, func(i, j int) bool {
-		return rank[reposList[i].Path] < rank[reposList[j].Path]
+		return order[reposList[i].Path] < order[reposList[j].Path]
 	})
+	return
+}
+
+func visitRepos(dependedReposList []pathutil.ReposPath, reposList []lockjson.Repos, plugconfMap map[pathutil.ReposPath]*ParsedInfo, visitedStatusMap map[pathutil.ReposPath]visitingStatus, order map[pathutil.ReposPath]int) (parseErrAll MultiParseError) {
+	reposPath := dependedReposList[len(dependedReposList)-1]
+	p, exists := plugconfMap[reposPath]
+	if !exists {
+		return
+	}
+	parseErr := newParseError(reposPath.Plugconf())
+	visitedStatusMap[reposPath] = visiting
+Main:
+	for _, dep := range p.depends {
+		switch visitedStatusMap[dep] {
+		case visiting:
+			str := formatCircularDependency(dependedReposList, dep)
+			parseErr.merr = multierror.Append(parseErr.merr,
+				errors.Errorf("s:depends(): circular dependency: %s", str))
+		case notVisited:
+			for _, repos := range reposList {
+				if repos.Path == dep {
+					errs := visitRepos(append(dependedReposList, dep), reposList, plugconfMap, visitedStatusMap, order)
+					parseErrAll = append(parseErrAll, errs...)
+					continue Main
+				}
+			}
+			parseErr.merr = multierror.Append(parseErr.merr,
+				errors.Errorf("s:depends(): missing plugin: %s", dep))
+		}
+	}
+	if parseErr.HasErrsOrWarns() {
+		parseErrAll = append(parseErrAll, *parseErr)
+	}
+	visitedStatusMap[reposPath] = visited
+	order[reposPath] = len(order)
+	return
+}
+
+func formatCircularDependency(dependedReposList []pathutil.ReposPath, head pathutil.ReposPath) string {
+	var graph []pathutil.ReposPath
+	for i, path := range dependedReposList {
+		if path == head {
+			graph = dependedReposList[i:]
+			break
+		}
+	}
+	graphStr := string(graph[0])
+	for _, path := range graph[1:] {
+		graphStr += " => " + string(path)
+	}
+	return graphStr
 }
 
 func getDepMaps(reposList []lockjson.Repos, plugconfMap map[pathutil.ReposPath]*ParsedInfo) (map[pathutil.ReposPath]*lockjson.Repos, map[pathutil.ReposPath]pathutil.ReposPathList, map[pathutil.ReposPath]pathutil.ReposPathList) {
@@ -835,57 +902,6 @@ func getDepMaps(reposList []lockjson.Repos, plugconfMap map[pathutil.ReposPath]*
 		}
 	}
 	return reposMap, depsMap, rdepsMap
-}
-
-func makeDepTree(reposPath pathutil.ReposPath, reposMap map[pathutil.ReposPath]*lockjson.Repos, depsMap map[pathutil.ReposPath]pathutil.ReposPathList, rdepsMap map[pathutil.ReposPath]pathutil.ReposPathList) *reposDepTree {
-	visitedNodes := make(map[pathutil.ReposPath]*reposDepNode, len(reposMap))
-	node := makeNodes(reposPath, reposMap, depsMap, rdepsMap, visitedNodes)
-	leaves := make([]reposDepNode, 0, 10)
-	visitedMarks := make(map[pathutil.ReposPath]bool, 10)
-	visitNode(node, func(n *reposDepNode) {
-		if len(n.dependTo) == 0 {
-			leaves = append(leaves, *n)
-		}
-	}, visitedMarks)
-	return &reposDepTree{leaves: leaves}
-}
-
-func makeNodes(reposPath pathutil.ReposPath, reposMap map[pathutil.ReposPath]*lockjson.Repos, depsMap map[pathutil.ReposPath]pathutil.ReposPathList, rdepsMap map[pathutil.ReposPath]pathutil.ReposPathList, visited map[pathutil.ReposPath]*reposDepNode) *reposDepNode {
-	if node, exists := visited[reposPath]; exists {
-		return node
-	}
-	node := &reposDepNode{repos: reposMap[reposPath]}
-	visited[reposPath] = node
-	for i := range depsMap[reposPath] {
-		dep := makeNodes(depsMap[reposPath][i], reposMap, depsMap, rdepsMap, visited)
-		node.dependTo = append(node.dependTo, *dep)
-	}
-	for i := range rdepsMap[reposPath] {
-		rdep := makeNodes(rdepsMap[reposPath][i], reposMap, depsMap, rdepsMap, visited)
-		node.dependedBy = append(node.dependedBy, *rdep)
-	}
-	return node
-}
-
-func visitNode(node *reposDepNode, callback func(*reposDepNode), visited map[pathutil.ReposPath]bool) {
-	if node == nil || node.repos == nil || visited[node.repos.Path] {
-		return
-	}
-	visited[node.repos.Path] = true
-	callback(node)
-	for i := range node.dependTo {
-		visitNode(&node.dependTo[i], callback, visited)
-	}
-	for i := range node.dependedBy {
-		visitNode(&node.dependedBy[i], callback, visited)
-	}
-}
-
-func makeRank(rank map[pathutil.ReposPath]int, node *reposDepNode, value int) {
-	rank[node.repos.Path] = value
-	for i := range node.dependedBy {
-		makeRank(rank, &node.dependedBy[i], value+1)
-	}
 }
 
 // Template is a content of plugconf template.
