@@ -270,6 +270,12 @@ function! s:on_load_pre()
   let g:openbrowser_github_always_use_commit_hash = 1
 endfunction
 
+" Plugin configuration like the code written in vimrc.
+" This configuration is executed *after* a plugin is loaded.
+function! s:on_load_post()
+  call openbrowser#open('https://example.net/my-start-page.html')
+endfunction
+
 " This function determines when a plugin is loaded.
 "
 " Possible values are:
@@ -286,7 +292,7 @@ function! s:loaded_on()
 endfunction
 
 " Dependencies of this plugin.
-" The specified dependencies are loaded after this plugin is loaded.
+" The specified plugins are loaded *before* this plugin is loaded.
 "
 " This function must contain 'return [<repos>, ...]' code.
 " (the argument of :return must be list literal, and the elements are string)

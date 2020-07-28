@@ -873,7 +873,7 @@ function! s:loaded_on()
 endfunction`
 
 const skeletonPlugconfDepends = `" Dependencies of this plugin.
-" The specified dependencies are loaded after this plugin is loaded.
+" The specified plugins are loaded *before* this plugin is loaded.
 "
 " This function must contain 'return [<repos>, ...]' code.
 " (the argument of :return must be list literal, and the elements are string)
